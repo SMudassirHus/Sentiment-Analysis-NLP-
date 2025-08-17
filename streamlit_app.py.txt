@@ -1,0 +1,267 @@
+import os
+import re
+import pickle
+from io import BytesIO
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# Optional viz (pie + wordclouds)
+import matplotlib.pyplot as plt
+from wordcloud import WordCloud
+
+
+# =========================
+# Page & paths
+# =========================
+st.set_page_config(page_title="Alexa Sentiment", page_icon="🔊", layout="centered")
+st.title("Text Sentiment Predictor (Amazon Alexa)")
+st.caption("Upload a CSV for bulk prediction or type a single sentence.")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, "Models")
+
+
+# =========================
+# Load artifacts (cached)
+# =========================
+@st.cache_resource(show_spinner=True)
+def load_artifacts():
+    with open(os.path.join(MODELS_DIR, "model_xgb.pkl"), "rb") as f:
+        predictor = pickle.load(f)
+    with open(os.path.join(MODELS_DIR, "scaler.pkl"), "rb") as f:
+        scaler = pickle.load(f)
+    with open(os.path.join(MODELS_DIR, "countVectorizer.pkl"), "rb") as f:
+        cv = pickle.load(f)
+    return predictor, scaler, cv
+
+
+try:
+    predictor, scaler, cv = load_artifacts()
+except Exception as e:
+    st.error(f"Failed to load model artifacts from {MODELS_DIR}: {e}")
+    st.stop()
+
+
+# =========================
+# Stopwords + stemmer (with safe fallbacks)
+# =========================
+def load_stopwords_and_stemmer():
+    try:
+        import nltk
+        nltk.download("stopwords", quiet=True)
+        from nltk.corpus import stopwords
+        from nltk.stem.porter import PorterStemmer
+
+        STOPWORDS = set(stopwords.words("english"))
+        stemmer = PorterStemmer()
+        return STOPWORDS, stemmer
+    except Exception:
+        # Fallback to sklearn stopwords if NLTK unavailable
+        try:
+            from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+            STOPWORDS = set(ENGLISH_STOP_WORDS)
+        except Exception:
+            STOPWORDS = set()
+
+        class DummyStem:
+            def stem(self, w): return w
+
+        return STOPWORDS, DummyStem()
+
+
+STOPWORDS, stemmer = load_stopwords_and_stemmer()
+
+
+# =========================
+# Text preprocessing
+# =========================
+def preprocess_text(s: str) -> str:
+    s = "" if s is None else str(s)
+    s = re.sub("[^a-zA-Z]", " ", s)
+    toks = s.lower().split()
+    toks = [stemmer.stem(w) for w in toks if w not in STOPWORDS]
+    return " ".join(toks)
+
+
+# =========================
+# Helpers for robust mapping
+# =========================
+def get_classes():
+    try:
+        return np.array(getattr(predictor, "classes_", []))
+    except Exception:
+        return np.array([])
+
+CLASSES = get_classes()
+
+def default_pos_class():
+    # Prefer 1 if present; else "Positive"/"positive"; else first class
+    if CLASSES.size:
+        if 1 in CLASSES:
+            return 1
+        cl_str = np.array([str(x).lower() for x in CLASSES])
+        if "positive" in cl_str:
+            return CLASSES[int(np.where(cl_str == "positive")[0][0])]
+        return CLASSES[0]
+    return 1  # sensible default
+
+
+# =========================
+# Sidebar controls
+# =========================
+st.sidebar.header("⚙️ Settings")
+pos_class = st.sidebar.selectbox(
+    "Which model class corresponds to **Positive** sentiment?",
+    options=CLASSES.tolist() if CLASSES.size else [1, 0],
+    index=(CLASSES.tolist().index(default_pos_class()) if CLASSES.size else 0),
+    help="If your training used 1=Positive (typical), keep 1. If results look inverted, choose 0."
+)
+threshold = st.sidebar.slider(
+    "Decision threshold for Positive",
+    min_value=0.05, max_value=0.95, value=0.50, step=0.05,
+    help="If the dataset is imbalanced, a threshold other than 0.5 may work better."
+)
+
+
+# =========================
+# Prediction
+# =========================
+def predict_raw(texts, pos_class_value, thr):
+    """
+    Returns:
+      labels_txt : list[str] of 'Positive'/'Negative' based on selected pos_class and threshold
+      probs_dict : dict mapping class -> probability per row (if predict_proba exists), else None
+    """
+    X = cv.transform([preprocess_text(t) for t in texts]).toarray()
+    Xs = scaler.transform(X)
+
+    probs_dict = None
+    if hasattr(predictor, "predict_proba"):
+        probs = predictor.predict_proba(Xs)  # (n, n_classes)
+        classes = np.array(getattr(predictor, "classes_", []))
+        # map class -> column
+        class_to_col = {c: i for i, c in enumerate(classes)} if classes.size else {0: 0, 1: 1}
+        pos_idx = class_to_col.get(pos_class_value, None)
+
+        if pos_idx is None:
+            # fallback: argmax mapping
+            top_idx = probs.argmax(axis=1)
+            pred_class = classes[top_idx] if classes.size else top_idx
+            labels_txt = ["Positive" if str(pc).lower() in ("1", "pos", "positive") else "Negative"
+                          for pc in pred_class]
+        else:
+            pos_prob = probs[:, pos_idx]
+            labels_bin = (pos_prob >= thr).astype(int)
+            labels_txt = ["Positive" if b == 1 else "Negative" for b in labels_bin]
+
+        # build probs dict for display
+        if classes.size == 2:
+            c0, c1 = classes[0], classes[1]
+            probs_dict = {c0: probs[:, 0], c1: probs[:, 1]}
+        else:
+            # handle unusual cases
+            probs_dict = {int(c): probs[:, i] for i, c in enumerate(classes)} if classes.size else None
+        return labels_txt, probs_dict, classes
+    else:
+        # models without predict_proba
+        pred_class = predictor.predict(Xs)
+        labels_txt = ["Positive" if str(pc).lower() in ("1", "pos", "positive") else "Negative"
+                      for pc in pred_class]
+        return labels_txt, None, np.array([])
+
+
+def show_probs_for_one(probs_dict, classes, idx=0):
+    if probs_dict is None:
+        return
+    st.caption(
+        " | ".join([f"P(class {c}) = {float(probs_dict[c][idx]):.3f}" for c in classes])
+        + f"  •  classes_: {list(classes)}"
+    )
+
+
+# =========================
+# UI controls
+# =========================
+uploaded_file = st.file_uploader(
+    "CSV with a text column (auto-detects: Sentence / verified_reviews / review / text)",
+    type=["csv"]
+)
+user_text = st.text_input("Single text prediction", "")
+
+col1, col2 = st.columns(2)
+with col1:
+    run_bulk = st.button("Predict CSV")
+with col2:
+    run_single = st.button("Predict Text")
+
+
+# =========================
+# Bulk prediction
+# =========================
+if run_bulk:
+    if uploaded_file is None:
+        st.warning("Please upload a CSV first.")
+    else:
+        try:
+            df = pd.read_csv(uploaded_file)
+        except Exception as e:
+            st.error(f"Could not read CSV: {e}")
+            st.stop()
+
+        # auto-detect the text column
+        text_col = next((c for c in ["Sentence", "verified_reviews", "review", "text"] if c in df.columns), None)
+        if not text_col:
+            st.error("CSV must contain one of: Sentence, verified_reviews, review, text")
+        else:
+            labels_txt, probs_dict, classes = predict_raw(
+                df[text_col].astype(str).tolist(), pos_class_value=pos_class, thr=threshold
+            )
+            df["Predicted sentiment"] = labels_txt
+
+            st.subheader("Preview")
+            st.dataframe(df.head(20))
+
+            # Download
+            buf = BytesIO()
+            df.to_csv(buf, index=False)
+            buf.seek(0)
+            st.download_button("Download Predictions.csv", buf, file_name="Predictions.csv")
+
+            # Distribution chart
+            st.subheader("Sentiment Distribution")
+            counts = df["Predicted sentiment"].value_counts()
+            fig, ax = plt.subplots()
+            counts.plot(kind="pie", autopct="%1.1f%%", startangle=90, ylabel="", ax=ax)
+            st.pyplot(fig)
+
+            # WordClouds (optional)
+            try:
+                st.subheader("WordClouds")
+                for label in ["Positive", "Negative"]:
+                    text_blob = " ".join(
+                        df.loc[df["Predicted sentiment"] == label, text_col].astype(str).tolist()
+                    )
+                    text_blob = preprocess_text(text_blob)
+                    if text_blob.strip():
+                        wc = WordCloud(background_color="white", max_words=100).generate(text_blob)
+                        fig2, ax2 = plt.subplots(figsize=(5, 5))
+                        ax2.imshow(wc)
+                        ax2.axis("off")
+                        ax2.set_title(f"{label} reviews")
+                        st.pyplot(fig2)
+            except Exception as e:
+                st.info(f"WordClouds skipped: {e}")
+
+
+# =========================
+# Single prediction
+# =========================
+if run_single:
+    if not user_text.strip():
+        st.warning("Please enter some text.")
+    else:
+        labels_txt, probs_dict, classes = predict_raw([user_text], pos_class_value=pos_class, thr=threshold)
+        st.success(f"Prediction: **{labels_txt[0]}**")
+        show_probs_for_one(probs_dict, classes, idx=0)
